@@ -40,6 +40,8 @@ pub struct H3AuditStats {
     stream_id: u64,
     /// The number of bytes sent over the stream.
     downstream_bytes_sent: AtomicU64,
+    /// See [`H3AuditStats::wire_bytes_sent`].
+    wire_bytes_sent: AtomicU64,
     /// The number of bytes received over the stream.
     downstream_bytes_recvd: AtomicU64,
     /// A STOP_SENDING error code received from the peer.
@@ -76,6 +78,7 @@ impl H3AuditStats {
         Self {
             stream_id,
             downstream_bytes_sent: AtomicU64::new(0),
+            wire_bytes_sent: AtomicU64::new(0),
             downstream_bytes_recvd: AtomicU64::new(0),
             recvd_stop_sending_error_code: AtomicI64::new(-1),
             recvd_reset_stream_error_code: AtomicI64::new(-1),
@@ -97,6 +100,20 @@ impl H3AuditStats {
     #[inline]
     pub fn downstream_bytes_sent(&self) -> u64 {
         self.downstream_bytes_sent.load(Ordering::SeqCst)
+    }
+
+    /// Wire bytes written on this stream via `process_write_frame()`:
+    /// HEADERS/trailers framing + QPACK, plus DATA framing + payload.
+    /// Excludes GREASE, QUIC packet overhead, retransmissions, and
+    /// control-stream bytes.
+    ///
+    /// Server: full response HEADERS/DATA/trailers, i.e. the `bs` input.
+    /// Client: request DATA/trailers only — request HEADERS predate this
+    /// stats handle and response bytes are received, not sent, so neither
+    /// is counted. Not a response byte count on the client side.
+    #[inline]
+    pub fn wire_bytes_sent(&self) -> u64 {
+        self.wire_bytes_sent.load(Ordering::SeqCst)
     }
 
     /// The number of bytes received over the stream.
@@ -164,6 +181,11 @@ impl H3AuditStats {
     pub fn add_downstream_bytes_sent(&self, bytes_sent: u64) {
         self.downstream_bytes_sent
             .fetch_add(bytes_sent, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn add_wire_bytes_sent(&self, bytes_sent: u64) {
+        self.wire_bytes_sent.fetch_add(bytes_sent, Ordering::SeqCst);
     }
 
     #[inline]
