@@ -1364,6 +1364,110 @@ mod server_side_driver {
         assert_eq!(audit_stats.downstream_bytes_sent(), 0);
     }
 
+    /// A stream whose outbound sender is closed without a fin must have its
+    /// write direction reset and its wire counters finalized, so a consumer
+    /// waiting on `counters_final()` is released.
+    #[test]
+    fn closing_outbound_sender_without_fin_resets_and_finalizes() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let stream_id = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+
+        helper.advance_and_run_loop().unwrap();
+        let req = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req.stream_id, stream_id);
+        assert!(!req.read_fin);
+        let to_client = req.send.get_ref().unwrap().clone();
+        let mut from_client = req.recv;
+        let audit_stats = req.h3_audit_stats;
+        let mut outbound = req.send;
+
+        // Write response headers, then the proxy errors before enqueueing a
+        // fin (the upstream-timeout-after-headers case).
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+
+        // The proxy closes the outbound sender instead of sending a fin. The
+        // driver sees the channel close and resets the write direction. The
+        // cloned inner sender must be dropped so closing the `PollSender`
+        // actually closes the channel.
+        drop(to_client);
+        outbound.close();
+        helper.work_loop_iter().unwrap();
+
+        // `RequestCancelled` (0x10c = 268): the write-direction reset is the
+        // path that calls `mark_counters_final()`, releasing the finalize wait.
+        assert_eq!(audit_stats.sent_reset_stream_error_code(), 268);
+        assert!(
+            futures::FutureExt::now_or_never(audit_stats.counters_final())
+                .is_some(),
+            "write-direction reset must finalize the counters"
+        );
+
+        // The client finishes its request body (read side), draining the
+        // stream from the map so teardown completes.
+        helper.peer_client_send_body(0, &[1, 2, 3], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let (body, fin, _err) = helper.driver_try_recv_body(&mut from_client);
+        assert_eq!(body, &[1, 2, 3]);
+        assert!(fin);
+        assert_eq!(helper.driver.stream_map.len(), 0);
+        assert_eq!(audit_stats.sent_reset_stream_error_code(), 268);
+    }
+
+    /// A bodyless client request finalizes its wire counters at request time,
+    /// even while the response direction is still open.
+    #[test]
+    fn bodyless_client_request_finalizes_counters_with_response_open() {
+        let mut helper = DriverTestHelper::<ClientHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client sends a bodyless request: the driver sends FIN immediately.
+        let stream_id = helper
+            .driver_send_request(make_request_headers("GET"), true)
+            .unwrap();
+
+        // Server reads the request and responds with headers only.
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.peer_server_poll().unwrap(),
+            (0, h3::Event::Headers { .. })
+        );
+        helper.peer_server_send_response(0, false).unwrap();
+
+        helper.advance_and_run_loop().unwrap();
+        let resp = assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::IncomingHeaders(headers) => { headers }
+        );
+        assert_eq!(resp.stream_id, stream_id);
+        assert!(!resp.read_fin);
+
+        // The write direction already finished when the request was sent, so
+        // the counters are final even though the response direction is open.
+        assert!(
+            futures::FutureExt::now_or_never(
+                resp.h3_audit_stats.counters_final()
+            )
+            .is_some(),
+            "bodyless request must finalize the counters at request time"
+        );
+    }
+
     /// Test the case where the client sends a RESET_STREAM quiche frame.
     /// The peer sends its reset before we send a fin
     #[test]

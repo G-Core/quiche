@@ -939,6 +939,7 @@ impl<H: DriverHooks> H3Driver<H> {
         ctx.fin_or_reset_sent = true;
         ctx.audit_stats
             .set_sent_stream_fin(StreamClosureKind::Explicit);
+        ctx.audit_stats.mark_counters_final();
         if ctx.fin_or_reset_recv {
             // Return a TransportError to trigger stream cleanup
             // instead of h3::Error::Done
@@ -1289,6 +1290,9 @@ impl<H: DriverHooks> H3Driver<H> {
             match recv.try_recv() {
                 Ok(frame) => ctx.queued_frame = Some(frame),
                 Err(TryRecvError::Disconnected) => {
+                    // The app's sender is gone, so the driver can never write
+                    // more bytes on this stream and the counters are final.
+                    ctx.audit_stats.mark_counters_final();
                     if !ctx.fin_or_reset_sent &&
                         ctx.associated_dgram_flow_id.is_none()
                     // The channel might be closed if the stream was used to

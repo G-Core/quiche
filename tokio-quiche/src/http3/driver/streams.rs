@@ -134,6 +134,9 @@ impl StreamCtx {
         // We can't accept additional frames
         self.queued_frame = None;
         self.recv = None;
+        // The peer refusing further response bytes makes the billed wire
+        // counters final, so release any counters-final waiters.
+        self.audit_stats.mark_counters_final();
     }
 
     pub(crate) fn handle_recvd_reset(&mut self, wire_err_code: u64) {
@@ -152,6 +155,9 @@ impl StreamCtx {
         self.audit_stats
             .set_sent_reset_stream_error_code(wire_err_code as i64);
         self.fin_or_reset_sent = true;
+        // Closing the write direction means no further response bytes can be
+        // written on this stream, so the billed wire counters are final.
+        self.audit_stats.mark_counters_final();
     }
 
     pub(crate) fn handle_sent_stop_sending(&mut self, wire_err_code: u64) {
@@ -163,10 +169,22 @@ impl StreamCtx {
         // that without an application read.
         self.fin_or_reset_recv = true;
         self.send = None;
+        // Deliberately does not mark the counters final: STOP_SENDING closes
+        // the receive direction while the response write side may still be
+        // sending.
     }
 
     pub(crate) fn both_directions_done(&self) -> bool {
         self.fin_or_reset_recv && self.fin_or_reset_sent
+    }
+}
+
+impl Drop for StreamCtx {
+    fn drop(&mut self) {
+        // The driver cannot write further bytes for a stream it no longer
+        // tracks, so this releases counter waiters on any stream ending that
+        // did not already signal (fin flush, write reset, STOP_SENDING).
+        self.audit_stats.mark_counters_final();
     }
 }
 
@@ -271,5 +289,40 @@ impl Future for WaitForUpstreamCapacity {
             }),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recvd_stop_sending_finalizes_counters_with_read_direction_open() {
+        let (mut ctx, _to_client, _from_client) = StreamCtx::new(0, 16);
+        // Body bytes were already handed to the writer before the peer
+        // refused further response bytes.
+        ctx.audit_stats.add_downstream_bytes_sent(42);
+
+        // The request (read) direction is still open; only the write side is
+        // being shut down by the peer's STOP_SENDING.
+        assert!(!ctx.fin_or_reset_recv);
+
+        ctx.handle_recvd_stop_sending(4242);
+
+        assert!(
+            !ctx.fin_or_reset_recv,
+            "STOP_SENDING must not close the read direction"
+        );
+
+        // The counters-final signal fires even though the read direction is
+        // still open, under a bounded wait so a broken wake fails, not hangs.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.audit_stats.counters_final(),
+        )
+        .await
+        .expect("STOP_SENDING must finalize the counters");
+        assert_eq!(ctx.audit_stats.downstream_bytes_sent(), 42);
+        assert_eq!(ctx.audit_stats.recvd_stop_sending_error_code(), 4242);
     }
 }
