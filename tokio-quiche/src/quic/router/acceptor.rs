@@ -168,7 +168,9 @@ where
 
             #[allow(unused_variables)]
             let Some(udp) = socket.as_udp_socket() else {
-                let _ = socket.send_to(send_buf, to).await;
+                let _ = socket
+                    .send_to_from(send_buf, to, Some(incoming.local_addr))
+                    .await;
                 return;
             };
 
@@ -189,7 +191,9 @@ where
             }
 
             #[cfg(not(target_os = "linux"))]
-            let _ = socket.send_to(send_buf, to).await;
+            let _ = socket
+                .send_to_from(send_buf, to, Some(incoming.local_addr))
+                .await;
         });
 
         Ok(None)

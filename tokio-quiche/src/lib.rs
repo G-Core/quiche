@@ -132,6 +132,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::metrics::Metrics;
 use crate::socket::QuicListener;
+use crate::socket::Socket;
 
 pub use crate::http3::driver::ClientH3Controller;
 pub use crate::http3::driver::ClientH3Driver;
@@ -156,6 +157,11 @@ pub use crate::result::QuicResultExt;
 /// this stream. These do not indicate that the listener itself has failed.
 pub type QuicConnectionStream<M> =
     ReceiverStream<io::Result<InitialQuicConnection<UdpSocket, M>>>;
+
+/// A stream of accepted [`InitialQuicConnection`]s from a [`listen_with_send`]
+/// call, whose send half is an application-provided socket type.
+pub type QuicSendConnectionStream<Tx, M> =
+    ReceiverStream<io::Result<InitialQuicConnection<Tx, M>>>;
 
 /// Starts listening for inbound QUIC connections on the given
 /// [`QuicListener`]s.
@@ -207,6 +213,56 @@ where
         .collect::<io::Result<_>>()?;
 
     listen_with_capabilities(quic_sockets, params, metrics)
+}
+
+/// Starts listening for inbound QUIC connections on the given split sockets.
+///
+/// Unlike [`listen`], the sending half of each socket is an
+/// application-provided [`datagram_socket::DatagramSocketSend`] instead of the
+/// receiving [`UdpSocket`]. The worker and accept paths pass each inbound
+/// packet's destination address to
+/// [`datagram_socket::DatagramSocketSend::poll_send_to_from`], letting the
+/// application choose the source address (and port) of its replies.
+///
+/// Each item pairs a [`Socket`] with the [`ConnectionIdGenerator`] to use for
+/// its connections.
+pub fn listen_with_send<Tx, Rx, M>(
+    sockets: impl IntoIterator<
+        Item = (Socket<Tx, Rx>, Arc<dyn ConnectionIdGenerator<'static>>),
+    >,
+    params: ConnectionParams, metrics: M,
+) -> io::Result<Vec<QuicSendConnectionStream<Tx, M>>>
+where
+    Tx: crate::datagram_socket::DatagramSocketSend + Send + Sync + 'static,
+    Rx: crate::datagram_socket::DatagramSocketRecv + Unpin + 'static,
+    M: Metrics,
+{
+    if params.settings.capture_quiche_logs {
+        capture_quiche_logs();
+    }
+
+    sockets
+        .into_iter()
+        .map(|(socket, cid_generator)| {
+            let Socket {
+                send,
+                recv,
+                local_addr,
+                capabilities,
+                ..
+            } = socket;
+            let accept_stream = crate::quic::start_listener_with_halves(
+                Arc::new(send),
+                recv,
+                local_addr,
+                capabilities,
+                cid_generator,
+                &params,
+                metrics.clone(),
+            )?;
+            Ok(ReceiverStream::new(accept_stream))
+        })
+        .collect()
 }
 
 static GLOBAL_LOGGER_ONCE: Once = Once::new();

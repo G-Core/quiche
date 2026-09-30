@@ -170,6 +170,39 @@ pub trait DatagramSocketSend: Sync {
         &self, cx: &mut Context, buf: &[u8], addr: SocketAddr,
     ) -> Poll<io::Result<usize>>;
 
+    /// Attempts to send data to `addr`, sourcing it from `from`.
+    ///
+    /// `from` is the local address the datagram should appear to originate
+    /// from, typically the destination address the corresponding inbound
+    /// packet arrived on. `None` means no source selection is requested and the
+    /// socket's own bound address is used.
+    ///
+    /// The default forwards to [`DatagramSocketSend::poll_send_to`], ignoring
+    /// `from`, which is correct for sockets that cannot choose a source. Types
+    /// that can (e.g. a socket bound to the exact source address) override it.
+    ///
+    /// Note that on multiple calls to a `poll_*` method in the send direction,
+    /// only the `Waker` from the `Context` passed to the most recent call
+    /// will be scheduled to receive a wakeup.
+    ///
+    /// # Return value
+    ///
+    /// The function returns:
+    ///
+    /// * `Poll::Pending` if the socket is not ready to write
+    /// * `Poll::Ready(Ok(n))` `n` is the number of bytes sent.
+    /// * `Poll::Ready(Err(e))` if an error is encountered.
+    ///
+    /// # Errors
+    ///
+    /// This function may encounter any standard I/O error except `WouldBlock`.
+    fn poll_send_to_from(
+        &self, cx: &mut Context, buf: &[u8], addr: SocketAddr,
+        _from: Option<SocketAddr>,
+    ) -> Poll<io::Result<usize>> {
+        self.poll_send_to(cx, buf, addr)
+    }
+
     /// Attempts to send multiple packets of data on the socket to the remote
     /// address to which it was previously connected.
     ///
@@ -247,6 +280,14 @@ pub trait DatagramSocketSendExt: DatagramSocketSend {
         &self, buf: &[u8], addr: SocketAddr,
     ) -> impl Future<Output = io::Result<usize>> {
         poll_fn(move |cx| self.poll_send_to(cx, buf, addr))
+    }
+
+    /// Sends data to `addr`, sourcing it from `from` when supported. On
+    /// success, returns the number of bytes written.
+    fn send_to_from(
+        &self, buf: &[u8], addr: SocketAddr, from: Option<SocketAddr>,
+    ) -> impl Future<Output = io::Result<usize>> {
+        poll_fn(move |cx| self.poll_send_to_from(cx, buf, addr, from))
     }
 
     /// Sends multiple data packets on the socket to the to the remote address
@@ -453,6 +494,15 @@ impl<T: AsDatagramSocketSend + Sync> DatagramSocketSend for T {
         &self, cx: &mut Context, buf: &[u8], addr: SocketAddr,
     ) -> Poll<io::Result<usize>> {
         self.as_datagram_socket_send().poll_send_to(cx, buf, addr)
+    }
+
+    #[inline]
+    fn poll_send_to_from(
+        &self, cx: &mut Context, buf: &[u8], addr: SocketAddr,
+        from: Option<SocketAddr>,
+    ) -> Poll<io::Result<usize>> {
+        self.as_datagram_socket_send()
+            .poll_send_to_from(cx, buf, addr, from)
     }
 
     #[inline]
@@ -807,6 +857,19 @@ impl<T: DatagramSocketSend> DatagramSocketSend for MaybeConnectedSocket<T> {
             self.inner.poll_send(cx, buf)
         } else {
             self.inner.poll_send_to(cx, buf, addr)
+        }
+    }
+
+    #[inline]
+    fn poll_send_to_from(
+        &self, cx: &mut Context, buf: &[u8], addr: SocketAddr,
+        from: Option<SocketAddr>,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(peer) = self.peer {
+            debug_assert_eq!(peer, addr);
+            self.inner.poll_send(cx, buf)
+        } else {
+            self.inner.poll_send_to_from(cx, buf, addr, from)
         }
     }
 

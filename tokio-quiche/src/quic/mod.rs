@@ -80,6 +80,7 @@
 //! [listen]: crate::listen
 //! [iqc]: crate::InitialQuicConnection
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,6 +89,7 @@ use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
 use qlog::writer::make_qlog_writer_from_path;
 use qlog::writer::qlog_file_name;
+use tokio::sync::mpsc;
 
 use crate::http3::settings::Http3Settings;
 use crate::metrics::DefaultMetrics;
@@ -95,6 +97,7 @@ use crate::metrics::Metrics;
 use crate::settings::Config;
 use crate::socket::QuicListener;
 use crate::socket::Socket;
+use crate::socket::SocketCapabilities;
 use crate::ClientH3Controller;
 use crate::ClientH3Driver;
 use crate::ConnectionParams;
@@ -111,7 +114,9 @@ mod router;
 
 use self::connection::ApplicationOverQuic;
 use self::connection::ConnectionIdGenerator as _;
+use self::connection::InitialQuicConnection;
 use self::connection::QuicConnection;
+use self::connection::SharedConnectionIdGenerator;
 use self::router::acceptor::ConnectionAcceptor;
 use self::router::acceptor::ConnectionAcceptorConfig;
 use self::router::connector::ClientConnector;
@@ -297,11 +302,63 @@ where
         "O_NONBLOCK should be set for the listening socket"
     );
 
-    let config = Config::new(params, socket.capabilities).into_io()?;
-
     let local_addr = socket.socket.local_addr()?;
     let socket_tx = Arc::new(socket.socket);
     let socket_rx = Arc::clone(&socket_tx);
+
+    let accept_stream = start_listener_with_halves(
+        socket_tx,
+        socket_rx,
+        local_addr,
+        socket.capabilities,
+        socket.cid_generator,
+        params,
+        metrics,
+    )?;
+
+    Ok(QuicConnectionStream::new(accept_stream))
+}
+
+/// Transmit capabilities derived from the actual send half: GSO requires a
+/// concrete `UdpSocket`, so an application-provided [`DatagramSocketSend`] that
+/// is not one cannot segment coalesced packets and must not have GSO enabled.
+fn send_capabilities<Tx>(
+    socket_tx: &Tx, capabilities: SocketCapabilities,
+) -> SocketCapabilities
+where
+    Tx: DatagramSocketSend + ?Sized,
+{
+    if socket_tx.as_udp_socket().is_none() {
+        SocketCapabilities {
+            has_gso: false,
+            ..capabilities
+        }
+    } else {
+        capabilities
+    }
+}
+
+/// Starts a QUIC listener from an already-split socket, where the send half is
+/// an application-provided [`DatagramSocketSend`] rather than the receiving
+/// [`UdpSocket`] itself.
+///
+/// This is what enables an application to control the local source address (and
+/// port) of outbound datagrams: the worker and accept paths pass the inbound
+/// packet's destination through
+/// [`DatagramSocketSend::poll_send_to_from`](datagram_socket::DatagramSocketSend::poll_send_to_from).
+pub(crate) fn start_listener_with_halves<Tx, Rx, M>(
+    socket_tx: Arc<Tx>, socket_rx: Rx, local_addr: SocketAddr,
+    capabilities: SocketCapabilities, cid_generator: SharedConnectionIdGenerator,
+    params: &ConnectionParams, metrics: M,
+) -> std::io::Result<mpsc::Receiver<std::io::Result<InitialQuicConnection<Tx, M>>>>
+where
+    Tx: DatagramSocketSend + Send + Sync + 'static,
+    Rx: DatagramSocketRecv + Unpin + 'static,
+    M: Metrics,
+{
+    let capabilities = send_capabilities(&*socket_tx, capabilities);
+
+    let config = Config::new(params, capabilities).into_io()?;
 
     let acceptor = ConnectionAcceptor::new(
         ConnectionAcceptorConfig {
@@ -321,7 +378,7 @@ where
         },
         Arc::clone(&socket_tx),
         Default::default(),
-        socket.cid_generator,
+        cid_generator,
         metrics.clone(),
     );
 
@@ -344,5 +401,53 @@ where
             },
         }
     });
-    Ok(QuicConnectionStream::new(accept_stream))
+    Ok(accept_stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::Context;
+    use std::task::Poll;
+
+    struct FakeSend;
+
+    impl DatagramSocketSend for FakeSend {
+        fn poll_send(
+            &self, _cx: &mut Context<'_>, _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_send_to(
+            &self, _cx: &mut Context<'_>, _buf: &[u8], _addr: SocketAddr,
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    #[test]
+    fn custom_send_half_disables_gso() {
+        let capabilities = SocketCapabilities {
+            has_gso: true,
+            ..Default::default()
+        };
+
+        let out = send_capabilities(&FakeSend, capabilities);
+
+        assert!(!out.has_gso, "a send half that cannot segment must not GSO");
+    }
+
+    #[tokio::test]
+    async fn concrete_udp_send_half_keeps_gso() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let capabilities = SocketCapabilities {
+            has_gso: true,
+            ..Default::default()
+        };
+
+        let out = send_capabilities(&socket, capabilities);
+
+        assert!(out.has_gso, "a concrete UDP send half keeps GSO");
+    }
 }

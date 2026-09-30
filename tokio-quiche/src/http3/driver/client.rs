@@ -224,6 +224,9 @@ impl ClientHooks {
             stream_ctx
                 .audit_stats
                 .set_sent_stream_fin(StreamClosureKind::Explicit);
+            // The write direction is finished, so the counters are final even
+            // though the response direction may still be open.
+            stream_ctx.audit_stats.mark_counters_final();
         }
 
         if let Some(quarter_stream_id) =

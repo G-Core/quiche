@@ -835,12 +835,12 @@ where
             let (from, to) = self.write_state.selected_path.unzip();
 
             let to = to.unwrap_or(self.cfg.peer_addr);
-            let from = from.filter(|_| self.cfg.with_pktinfo);
 
             let send_res = if let (Some(udp_socket), true) =
                 (self.socket.as_udp_socket(), self.cfg.with_gso)
             {
                 // Only UDP supports GSO.
+                let from = from.filter(|_| self.cfg.with_pktinfo);
                 send_to(
                     udp_socket,
                     to,
@@ -854,7 +854,7 @@ where
                 )
                 .await
             } else {
-                self.socket.send_to(current_send_buf, to).await
+                self.socket.send_to_from(current_send_buf, to, from).await
             };
 
             #[cfg(feature = "perf-quic-listener-metrics")]

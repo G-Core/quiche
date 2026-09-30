@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -31,6 +32,7 @@ use std::time::Duration;
 
 use crossbeam::atomic::AtomicCell;
 use datagram_socket::StreamClosureKind;
+use tokio::sync::Notify;
 
 /// Stream-level HTTP/3 audit statistics recorded by
 /// [H3Driver](crate::http3::driver::H3Driver).
@@ -71,6 +73,9 @@ pub struct H3AuditStats {
     /// Measured across all HEADERS frames sent on the stream. A value of 0
     /// indicates there was no failed flushing.
     headers_flush_duration: AtomicCell<Duration>,
+    /// See [`H3AuditStats::mark_counters_final`].
+    counters_final: AtomicBool,
+    counters_final_notify: Notify,
 }
 
 impl H3AuditStats {
@@ -87,6 +92,8 @@ impl H3AuditStats {
             recvd_stream_fin: AtomicCell::new(StreamClosureKind::None),
             sent_stream_fin: AtomicCell::new(StreamClosureKind::None),
             headers_flush_duration: AtomicCell::new(Duration::from_secs(0)),
+            counters_final: AtomicBool::new(false),
+            counters_final_notify: Notify::new(),
         }
     }
 
@@ -236,11 +243,66 @@ impl H3AuditStats {
         self.sent_stream_fin.store(sent_stream_fin);
     }
 
+    /// Records that the driver will write no more bytes on this stream, so
+    /// the byte counters above are final, and wakes
+    /// [`Self::counters_final`].
+    #[inline]
+    pub fn mark_counters_final(&self) {
+        self.counters_final.store(true, Ordering::SeqCst);
+        self.counters_final_notify.notify_waiters();
+    }
+
+    /// Resolves once [`Self::mark_counters_final`] has been called, i.e. once
+    /// the byte counters have reached their final values for this stream.
+    pub async fn counters_final(&self) {
+        let notified = self.counters_final_notify.notified();
+        tokio::pin!(notified);
+        // Register interest before the flag check: `notify_waiters` only wakes
+        // already-registered waiters, so checking first could miss the signal.
+        notified.as_mut().enable();
+        if self.counters_final.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
     #[inline]
     pub fn add_header_flush_duration(&self, duration: Duration) {
         // NB: load and store may not be atomic but we aren't accessing the
         // object from any other thread so things should be ok.
         let current = self.headers_flush_duration.load();
         self.headers_flush_duration.store(current + duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn counters_final_wakes_a_waiter_registered_before_the_signal() {
+        let stats = H3AuditStats::new(0);
+        let fut = stats.counters_final();
+        tokio::pin!(fut);
+        // One poll performs `enable()` + the flag load, leaving the waiter
+        // registered for the signal.
+        assert!(futures::poll!(&mut fut).is_pending());
+        stats.mark_counters_final();
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("counters_final should complete after mark_counters_final");
+    }
+
+    #[tokio::test]
+    async fn counters_final_returns_immediately_after_the_signal() {
+        let stats = H3AuditStats::new(0);
+        stats.mark_counters_final();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stats.counters_final(),
+        )
+        .await
+        .expect("counters_final must return immediately once already final");
     }
 }
